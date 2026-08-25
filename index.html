@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Custard&reg; | Coming Soon</title>
+<meta name="description" content="Custard is a video production studio, currently in the kitchen. Come back soon.">
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='50' fill='%23FFE0A0'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@500;600&display=swap" rel="stylesheet">
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #FFE0A0;
+  }
+  canvas {
+    display: block;
+    position: fixed;
+    inset: 0;
+    width: 100vw;
+    height: 100vh;
+    filter: blur(1.1px);
+  }
+
+  .stage {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding-bottom: 12vh; /* nudges the group slightly above true center */
+    text-align: center;
+  }
+
+  .logo {
+    width: 132px;
+    height: auto;
+    margin-bottom: 26px;
+    user-select: none;
+    -webkit-user-drag: none;
+  }
+
+  .links {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    font-family: 'Manrope', sans-serif;
+    font-weight: 500;
+    font-size: 0.92rem;
+    letter-spacing: 0.01em;
+  }
+
+  .links a {
+    color: #2C1F14;
+    text-decoration: underline;
+    text-underline-offset: 3px;
+    text-decoration-thickness: 1px;
+    transition: opacity 0.15s ease;
+  }
+
+  .links a:hover,
+  .links a:focus-visible {
+    opacity: 0.6;
+  }
+
+  .links a:focus-visible {
+    outline: 2px solid #2C1F14;
+    outline-offset: 4px;
+  }
+
+  @media (max-width: 480px) {
+    .logo { width: 104px; margin-bottom: 20px; }
+    .links { font-size: 0.85rem; }
+  }
+</style>
+</head>
+<body>
+<canvas id="bg"></canvas>
+
+<div class="stage">
+  <img class="logo" src="custard-logo.png" alt="Custard">
+  <div class="links">
+    <a href="https://www.instagram.com/custard.film" target="_blank" rel="noopener">@custard.film</a>
+    <a href="mailto:hello@custard.film?subject=Business%20enquiry">hello@custard.film</a>
+  </div>
+</div>
+
+<script>
+(function () {
+  const canvas = document.getElementById('bg');
+  const ctx = canvas.getContext('2d', { alpha: false });
+
+  // Small offscreen simulation grid — rendered blocky, then upscaled with
+  // bilinear smoothing so it reads as a soft, folding fluid instead of pixels.
+  let cols, rows, gridCanvas, gridCtx, imgData, buf32;
+  let dye, dyeTmp, impulseX, impulseY, impulseXTmp, impulseYTmp;
+
+  const CELL_BUDGET = 13000;
+  const ADVECT_DT = 0.5;          // slower per-frame displacement — thick, heavy motion
+  const IMPULSE_DECAY = 0.991;    // disturbance lingers and settles slowly
+  const DYE_RELAX = 0.0006;       // very slow return to the flat baseline
+  const MOUSE_SMOOTHING = 0.12;   // lag between raw cursor motion and applied force (inertia)
+  const BASE = [255, 224, 160];   // #FFE0A0
+  const LOW  = [206, 140, 66];    // deeper caramel fold
+  const HIGH = [255, 246, 224];   // pale cream highlight
+  const SPEC_COLOR = [255, 252, 235]; // glint color on wave peaks
+
+  // Treat the dye field as a height map and light it with Blinn-Phong so
+  // bright glints sit on the crests facing the light, like light catching
+  // the skin of custard.
+  const HEIGHT_SCALE = 11;      // exaggerates slope for a punchier normal
+  const SHININESS = 28;         // higher = smaller, sharper glints
+  const SPEC_STRENGTH = 1.35;   // overall glint brightness
+  let LIGHT = normalize3(0.45, -0.62, 0.55);
+
+  function normalize3(x, y, z) {
+    const len = Math.sqrt(x * x + y * y + z * z) || 1;
+    return [x / len, y / len, z / len];
+  }
+
+  let W = 0, H = 0;
+  let t = 0;
+  let lastTime = performance.now();
+
+  let mouse = { gx: -1000, gy: -1000, pgx: -1000, pgy: -1000, smvx: 0, smvy: 0, has: false };
+
+  function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+
+  function setupGrid() {
+    const aspect = window.innerWidth / window.innerHeight;
+    cols = clamp(Math.round(Math.sqrt(CELL_BUDGET * aspect)), 60, 220);
+    rows = clamp(Math.round(cols / aspect), 60, 220);
+
+    gridCanvas = document.createElement('canvas');
+    gridCanvas.width = cols;
+    gridCanvas.height = rows;
+    gridCtx = gridCanvas.getContext('2d');
+    imgData = gridCtx.createImageData(cols, rows);
+    buf32 = new Uint32Array(imgData.data.buffer);
+
+    dye = new Float32Array(cols * rows);
+    dyeTmp = new Float32Array(cols * rows);
+    impulseX = new Float32Array(cols * rows);
+    impulseY = new Float32Array(cols * rows);
+    impulseXTmp = new Float32Array(cols * rows);
+    impulseYTmp = new Float32Array(cols * rows);
+
+    // Seed dye with smooth low-frequency variation so there's gentle
+    // marbling even before any interaction.
+    for (let j = 0; j < rows; j++) {
+      for (let i = 0; i < cols; i++) {
+        const v = 0.5 +
+          0.12 * Math.sin(i * 0.09 + j * 0.05) +
+          0.08 * Math.cos(i * 0.04 - j * 0.11) +
+          0.06 * Math.sin((i + j) * 0.06);
+        dye[j * cols + i] = clamp(v, 0, 1);
+      }
+    }
+  }
+
+  function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+    setupGrid();
+  }
+
+  function sampleBilinear(field, x, y) {
+    x = clamp(x, 0, cols - 1.001);
+    y = clamp(y, 0, rows - 1.001);
+    const x0 = Math.floor(x), y0 = Math.floor(y);
+    const x1 = x0 + 1, y1 = y0 + 1;
+    const sx = x - x0, sy = y - y0;
+    const i00 = y0 * cols + x0, i10 = y0 * cols + x1;
+    const i01 = y1 * cols + x0, i11 = y1 * cols + x1;
+    const top = field[i00] * (1 - sx) + field[i10] * sx;
+    const bot = field[i01] * (1 - sx) + field[i11] * sx;
+    return top * (1 - sy) + bot * sy;
+  }
+
+  function depositImpulse(gx, gy, dx, dy, dyeKick) {
+    const radius = 5;
+    for (let jj = -radius; jj <= radius; jj++) {
+      const j = Math.round(gy) + jj;
+      if (j < 0 || j >= rows) continue;
+      for (let ii = -radius; ii <= radius; ii++) {
+        const i = Math.round(gx) + ii;
+        if (i < 0 || i >= cols) continue;
+        const d2 = ii * ii + jj * jj;
+        const w = Math.exp(-d2 / (radius * radius * 0.5));
+        const idx = j * cols + i;
+        impulseX[idx] += dx * w;
+        impulseY[idx] += dy * w;
+        dye[idx] = clamp(dye[idx] + dyeKick * w, 0, 1);
+      }
+    }
+  }
+
+  function onPointerMove(clientX, clientY) {
+    const gx = (clientX / W) * (cols - 1);
+    const gy = (clientY / H) * (rows - 1);
+    if (!mouse.has) { mouse.pgx = gx; mouse.pgy = gy; }
+    mouse.gx = gx;
+    mouse.gy = gy;
+    mouse.has = true;
+  }
+
+  window.addEventListener('mousemove', (e) => onPointerMove(e.clientX, e.clientY));
+  window.addEventListener('touchmove', (e) => {
+    if (e.touches && e.touches.length) {
+      onPointerMove(e.touches[0].clientX, e.touches[0].clientY);
+    }
+  }, { passive: true });
+  window.addEventListener('mouseleave', () => { mouse.has = false; });
+
+  function step(dt) {
+    t += dt * 0.016;
+
+    // Cursor force: smoothed (laggy/viscous) velocity, deposited only at
+    // the cursor's actual current position — the only source of disturbance.
+    if (mouse.has) {
+      const rawvx = mouse.gx - mouse.pgx;
+      const rawvy = mouse.gy - mouse.pgy;
+      mouse.pgx = mouse.gx;
+      mouse.pgy = mouse.gy;
+      mouse.smvx += (rawvx - mouse.smvx) * MOUSE_SMOOTHING;
+      mouse.smvy += (rawvy - mouse.smvy) * MOUSE_SMOOTHING;
+
+      const speed = Math.sqrt(mouse.smvx * mouse.smvx + mouse.smvy * mouse.smvy);
+      if (speed > 0.0005) {
+        const tanX = -mouse.smvy, tanY = mouse.smvx;
+        const kick = clamp(speed * 0.5, 0, 1) * 0.9;
+        depositImpulse(
+          mouse.gx, mouse.gy,
+          (tanX * 0.8 + mouse.smvx * 0.2) * dt,
+          (tanY * 0.8 + mouse.smvy * 0.2) * dt,
+          (speed > 0.08 ? kick : 0) * (Math.sin(t * 3 + mouse.gx * 0.3) > 0 ? 1 : -1) * 0.05 * dt
+        );
+      }
+    }
+
+    // Decay + light diffusion of the mouse impulse field.
+    for (let j = 0; j < rows; j++) {
+      for (let i = 0; i < cols; i++) {
+        const idx = j * cols + i;
+        const l = i > 0 ? idx - 1 : idx;
+        const r = i < cols - 1 ? idx + 1 : idx;
+        const u = j > 0 ? idx - cols : idx;
+        const d = j < rows - 1 ? idx + cols : idx;
+        impulseXTmp[idx] = (impulseX[idx] * 0.6 + (impulseX[l] + impulseX[r] + impulseX[u] + impulseX[d]) * 0.1) * IMPULSE_DECAY;
+        impulseYTmp[idx] = (impulseY[idx] * 0.6 + (impulseY[l] + impulseY[r] + impulseY[u] + impulseY[d]) * 0.1) * IMPULSE_DECAY;
+      }
+    }
+    [impulseX, impulseXTmp] = [impulseXTmp, impulseX];
+    [impulseY, impulseYTmp] = [impulseYTmp, impulseY];
+
+    // Semi-Lagrangian advection of the dye field — velocity comes only
+    // from the (slowly decaying) cursor-driven impulse field.
+    for (let j = 0; j < rows; j++) {
+      for (let i = 0; i < cols; i++) {
+        const idx = j * cols + i;
+        const vx = impulseX[idx];
+        const vy = impulseY[idx];
+        const bx = i - vx * ADVECT_DT * dt;
+        const by = j - vy * ADVECT_DT * dt;
+        let v = sampleBilinear(dye, bx, by);
+        v += (0.5 - v) * DYE_RELAX;
+        dyeTmp[idx] = clamp(v, 0, 1);
+      }
+    }
+    [dye, dyeTmp] = [dyeTmp, dye];
+  }
+
+  function lerp(a, b, s) { return a + (b - a) * s; }
+
+  function render() {
+    const [lx, ly, lz] = LIGHT;
+    for (let j = 0; j < rows; j++) {
+      for (let i = 0; i < cols; i++) {
+        const idx = j * cols + i;
+        const v = dye[idx];
+        let r, g, b;
+        if (v < 0.5) {
+          const s = v / 0.5;
+          r = lerp(LOW[0], BASE[0], s);
+          g = lerp(LOW[1], BASE[1], s);
+          b = lerp(LOW[2], BASE[2], s);
+        } else {
+          const s = (v - 0.5) / 0.5;
+          r = lerp(BASE[0], HIGH[0], s);
+          g = lerp(BASE[1], HIGH[1], s);
+          b = lerp(BASE[2], HIGH[2], s);
+        }
+
+        // Surface normal from the local slope of the dye "height" field.
+        const il = i > 0 ? idx - 1 : idx;
+        const ir = i < cols - 1 ? idx + 1 : idx;
+        const ju = j > 0 ? idx - cols : idx;
+        const jd = j < rows - 1 ? idx + cols : idx;
+        const dzdx = (dye[ir] - dye[il]) * HEIGHT_SCALE;
+        const dzdy = (dye[jd] - dye[ju]) * HEIGHT_SCALE;
+        let nx = -dzdx, ny = -dzdy, nz = 1;
+        const nlen = Math.sqrt(nx * nx + ny * ny + nz * nz);
+        nx /= nlen; ny /= nlen; nz /= nlen;
+
+        // Blinn-Phong specular against a fixed light, view = straight on.
+        let hx = lx, hy = ly, hz = lz + 1;
+        const hlen = Math.sqrt(hx * hx + hy * hy + hz * hz) || 1;
+        hx /= hlen; hy /= hlen; hz /= hlen;
+        const ndoth = Math.max(0, nx * hx + ny * hy + nz * hz);
+        const spec = Math.pow(ndoth, SHININESS) * SPEC_STRENGTH * clamp((v - 0.35) * 1.8, 0, 1);
+
+        r = r + (255 - r) * clamp(spec * (SPEC_COLOR[0] / 255), 0, 1);
+        g = g + (255 - g) * clamp(spec * (SPEC_COLOR[1] / 255), 0, 1);
+        b = b + (255 - b) * clamp(spec * (SPEC_COLOR[2] / 255), 0, 1);
+
+        buf32[idx] = (255 << 24) | (b << 16) | (g << 8) | r;
+      }
+    }
+    gridCtx.putImageData(imgData, 0, 0);
+
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(gridCanvas, 0, 0, cols, rows, 0, 0, W, H);
+  }
+
+  function loop(now) {
+    const dt = clamp((now - lastTime) / 16.67, 0, 3);
+    lastTime = now;
+    step(dt);
+    render();
+    requestAnimationFrame(loop);
+  }
+
+  let resizeTimer;
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(resize, 150);
+  });
+
+  resize();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
